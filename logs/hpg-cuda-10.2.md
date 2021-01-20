@@ -8,7 +8,7 @@ summary: The problem comes from hpg does not have cuda/10.2 installed, The follo
 nvcc fatal   : Unknown option '-generate-dependencies-with-compile'
 ```
 #### To Repeat
-path: /blue/roitberg/jinzexue/dev/test
+path: /blue/roitberg/jinzexue/dev/test  
 nvcc info: 
 
 ```
