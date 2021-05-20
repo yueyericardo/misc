@@ -1,4 +1,4 @@
-jitted Sequential module is calling python function
+JITted Sequential module is calling python function
 
 output is
 ```
