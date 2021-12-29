@@ -1,7 +1,5 @@
 #include <torch/extension.h>
-// #include <ATen/native/cuda/TensorTopK.h>
 #define TORCH_ASSERT_NO_OPERATORS
-// #include <ATen/native/cuda/TensorTopK.h>
 #include <ATen/Dispatch.h>
 #include <ATen/ceil_div.h>
 #include <ATen/core/TensorBase.h>
@@ -157,6 +155,40 @@ __global__ void gatherTopK(
 
 } // namespace
 
+template <typename T, typename IndexType, int Dim, bool Order>
+void dispatchGatherTopK(
+    at::cuda::detail::TensorInfo<T, IndexType> input,
+    IndexType inputSliceSize,
+    IndexType outputSliceSize, // aka `k`
+
+    IndexType numInputSlices,
+    IndexType inputWithinSliceStride,
+
+    at::cuda::detail::TensorInfo<T, IndexType> topK,
+    IndexType numTopKSlices,
+    IndexType topKWithinSliceStride,
+
+    at::cuda::detail::TensorInfo<int64_t, IndexType> indices,
+    IndexType indicesWithinSliceStride) {
+  dim3 grid;
+  TORCH_INTERNAL_ASSERT(getGridFromTiles(numInputSlices, grid), "Too many slices to sort");
+  dim3 block(
+      std::min(at::ceil_div((int64_t)inputSliceSize, (int64_t)C10_WARP_SIZE) * (int64_t)C10_WARP_SIZE, (int64_t)1024));
+
+  gatherTopK<T, IndexType, Dim, Order><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      input,
+      inputSliceSize,
+      outputSliceSize,
+      numInputSlices,
+      inputWithinSliceStride,
+      topK,
+      numTopKSlices,
+      topKWithinSliceStride,
+      indices,
+      indicesWithinSliceStride);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void launch_gather_topk_kernel(
     const Tensor& self,
     int64_t k,
@@ -174,21 +206,19 @@ void launch_gather_topk_kernel(
   // static_cast is required to ensure that the correct type (INDEX_T)
   // is provided to the kernel for the arguments.
 
-#define RUN_K(INDEX_T, DIM, DIR)                                                                               \
-  gatherTopK<scalar_t, INDEX_T, DIM, DIR><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(              \
-      inputInfo,                                                                                               \
-      static_cast<INDEX_T>(sliceSize),                                                                         \
-      static_cast<INDEX_T>(k),                                                                                 \
-      static_cast<INDEX_T>(                                                                                    \
-          inputSlices), /* The actual dimension that the k-selection is running in */ /* may have changed from \
-                                                                                         collapseDims() */     \
-      static_cast<INDEX_T>(inputInfo.strides[collapseInputDim]),                                               \
-      topKInfo,                                                                                                \
-      static_cast<INDEX_T>(topKSlices),                                                                        \
-      static_cast<INDEX_T>(topKInfo.strides[collapseTopKDim]),                                                 \
-      indicesInfo,                                                                                             \
-      static_cast<INDEX_T>(indicesInfo.strides[collapseIndicesDim]));                                          \
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#define RUN_K(INDEX_T, DIM, DIR)                                                                                     \
+  dispatchGatherTopK<scalar_t, INDEX_T, DIM, DIR>(                                                                   \
+      inputInfo,                                                                                                     \
+      static_cast<INDEX_T>(sliceSize),                                                                               \
+      static_cast<INDEX_T>(k),                                                                                       \
+      static_cast<INDEX_T>(inputSlices), /* The actual dimension that the k-selection is running in may have changed \
+                                            from collapseDims() */                                                   \
+      static_cast<INDEX_T>(inputInfo.strides[collapseInputDim]),                                                     \
+      topKInfo,                                                                                                      \
+      static_cast<INDEX_T>(topKSlices),                                                                              \
+      static_cast<INDEX_T>(topKInfo.strides[collapseTopKDim]),                                                       \
+      indicesInfo,                                                                                                   \
+      static_cast<INDEX_T>(indicesInfo.strides[collapseIndicesDim]));
 
 #define RUN_DIR(INDEX_T, DIM)   \
   if (largest) {                \
@@ -208,66 +238,61 @@ void launch_gather_topk_kernel(
     RUN_DIR(INDEX_T, -1);    \
   }
 
-#define RUN_T(INDEX_T)                                                                                             \
-  do {                                                                                                             \
-    using scalar_t = float;                                                                                        \
-    at::cuda::detail::TensorInfo<scalar_t, INDEX_T> inputInfo =                                                    \
-        at::cuda::detail::getTensorInfo<scalar_t, INDEX_T>(input);                                                 \
-    at::cuda::detail::TensorInfo<scalar_t, INDEX_T> topKInfo =                                                     \
-        at::cuda::detail::getTensorInfo<scalar_t, INDEX_T>(values);                                                \
-    at::cuda::detail::TensorInfo<int64_t, INDEX_T> indicesInfo =                                                   \
-        at::cuda::detail::getTensorInfo<int64_t, INDEX_T>(indices);                                                \
-    /* tensorInfoLegacyIfScalar*/                                                                                  \
-    if (!input.dim()) {                                                                                            \
-      inputInfo.dims = 1;                                                                                          \
-      inputInfo.sizes[0] = 1;                                                                                      \
-      inputInfo.strides[0] = 1;                                                                                    \
-      topKInfo.dims = 1;                                                                                           \
-      topKInfo.sizes[0] = 1;                                                                                       \
-      topKInfo.strides[0] = 1;                                                                                     \
-      indicesInfo.dims = 1;                                                                                        \
-      indicesInfo.sizes[0] = 1;                                                                                    \
-      indicesInfo.strides[0] = 1;                                                                                  \
-    }                                                                                                              \
-    /* We use these structures solely to find the offset to */                                                     \
-    /* each slice we are operating on */                                                                           \
-    inputInfo.sizes[dim] = 1;                                                                                      \
-    topKInfo.sizes[dim] = 1;                                                                                       \
-    indicesInfo.sizes[dim] = 1;                                                                                    \
-    /* stash the stride of dim because it can be accidentally collapsed */                                         \
-    auto strideTopK = topKInfo.strides[dim];                                                                       \
-    auto strideIndices = indicesInfo.strides[dim];                                                                 \
-    /* Collapse all other dims */                                                                                  \
-    int collapseInputDim = inputInfo.collapseDims(dim);                                                            \
-    int collapseTopKDim = topKInfo.collapseDims(dim);                                                              \
-    int collapseIndicesDim = indicesInfo.collapseDims(dim);                                                        \
-    /* restore stride in case it was collapsed */                                                                  \
-    topKInfo.strides[collapseTopKDim] = strideTopK;                                                                \
-    indicesInfo.strides[collapseIndicesDim] = strideIndices;                                                       \
-    int64_t inputSlices = 1;                                                                                       \
-    for (int i = 0; i < inputInfo.dims; ++i) {                                                                     \
-      inputSlices *= inputInfo.sizes[i];                                                                           \
-    }                                                                                                              \
-    int64_t topKSlices = 1;                                                                                        \
-    for (int i = 0; i < topKInfo.dims; ++i) {                                                                      \
-      topKSlices *= topKInfo.sizes[i];                                                                             \
-    }                                                                                                              \
-                                                                                                                   \
-    dim3 grid;                                                                                                     \
-    TORCH_INTERNAL_ASSERT(getGridFromTiles(inputSlices, grid), "Too many slices to sort");                         \
-                                                                                                                   \
-    dim3 block(std::min(at::ceil_div(sliceSize, (int64_t)C10_WARP_SIZE) * (int64_t)C10_WARP_SIZE, (int64_t)1024)); \
-                                                                                                                   \
-    /* This is used as a template parameter to calculate indices. */                                               \
-    /* We only specialize it if all collapsed dim sizes are the */                                                 \
-    /* same; otherwise, we use -1 which is the specialization */                                                   \
-    /* parameter for arbitrary dimensions */                                                                       \
-    int allDims = inputInfo.dims;                                                                                  \
-    if (topKInfo.dims != allDims || indicesInfo.dims != allDims) {                                                 \
-      allDims = -1;                                                                                                \
-    }                                                                                                              \
-                                                                                                                   \
-    RUN_DIM(INDEX_T);                                                                                              \
+#define RUN_T(INDEX_T)                                                     \
+  do {                                                                     \
+    using scalar_t = float;                                                \
+    at::cuda::detail::TensorInfo<scalar_t, INDEX_T> inputInfo =            \
+        at::cuda::detail::getTensorInfo<scalar_t, INDEX_T>(input);         \
+    at::cuda::detail::TensorInfo<scalar_t, INDEX_T> topKInfo =             \
+        at::cuda::detail::getTensorInfo<scalar_t, INDEX_T>(values);        \
+    at::cuda::detail::TensorInfo<int64_t, INDEX_T> indicesInfo =           \
+        at::cuda::detail::getTensorInfo<int64_t, INDEX_T>(indices);        \
+    /* tensorInfoLegacyIfScalar*/                                          \
+    if (!input.dim()) {                                                    \
+      inputInfo.dims = 1;                                                  \
+      inputInfo.sizes[0] = 1;                                              \
+      inputInfo.strides[0] = 1;                                            \
+      topKInfo.dims = 1;                                                   \
+      topKInfo.sizes[0] = 1;                                               \
+      topKInfo.strides[0] = 1;                                             \
+      indicesInfo.dims = 1;                                                \
+      indicesInfo.sizes[0] = 1;                                            \
+      indicesInfo.strides[0] = 1;                                          \
+    }                                                                      \
+    /* We use these structures solely to find the offset to */             \
+    /* each slice we are operating on */                                   \
+    inputInfo.sizes[dim] = 1;                                              \
+    topKInfo.sizes[dim] = 1;                                               \
+    indicesInfo.sizes[dim] = 1;                                            \
+    /* stash the stride of dim because it can be accidentally collapsed */ \
+    auto strideTopK = topKInfo.strides[dim];                               \
+    auto strideIndices = indicesInfo.strides[dim];                         \
+    /* Collapse all other dims */                                          \
+    int collapseInputDim = inputInfo.collapseDims(dim);                    \
+    int collapseTopKDim = topKInfo.collapseDims(dim);                      \
+    int collapseIndicesDim = indicesInfo.collapseDims(dim);                \
+    /* restore stride in case it was collapsed */                          \
+    topKInfo.strides[collapseTopKDim] = strideTopK;                        \
+    indicesInfo.strides[collapseIndicesDim] = strideIndices;               \
+    int64_t inputSlices = 1;                                               \
+    for (int i = 0; i < inputInfo.dims; ++i) {                             \
+      inputSlices *= inputInfo.sizes[i];                                   \
+    }                                                                      \
+    int64_t topKSlices = 1;                                                \
+    for (int i = 0; i < topKInfo.dims; ++i) {                              \
+      topKSlices *= topKInfo.sizes[i];                                     \
+    }                                                                      \
+                                                                           \
+    /* This is used as a template parameter to calculate indices. */       \
+    /* We only specialize it if all collapsed dim sizes are the */         \
+    /* same; otherwise, we use -1 which is the specialization */           \
+    /* parameter for arbitrary dimensions */                               \
+    int allDims = inputInfo.dims;                                          \
+    if (topKInfo.dims != allDims || indicesInfo.dims != allDims) {         \
+      allDims = -1;                                                        \
+    }                                                                      \
+                                                                           \
+    RUN_DIM(INDEX_T);                                                      \
   } while (0)
 
   // the below is safe with 0-dimensional tensors because it is based on
