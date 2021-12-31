@@ -53,6 +53,14 @@ __global__ void print_kernel(T* x){
   printf("%f\n", *x);
 }
 
+template <typename T>
+__global__ void fill(T* x, T value, int size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+    x[i] = value;
+  }
+}
+
 template <typename T, typename IndexType, int Dim, bool Order>
 C10_LAUNCH_BOUNDS_1(1024)
 __global__ void gatherTopK(
@@ -198,7 +206,7 @@ C10_LAUNCH_BOUNDS_1(BLOCK_THREADS)
 __global__ void radixFindKthValues(
     at::cuda::detail::TensorInfo<T, IndexType> input,
     IndexType inputSliceSize,
-    IndexType outputSliceSize, // aka `k`
+    IndexType* ksToFind, // aka `k`
 
     IndexType numInputSlices,
     IndexType withinSliceStride,
@@ -221,7 +229,9 @@ __global__ void radixFindKthValues(
     return;
   }
 
+  // printf("Reach line number %d, %d %d %d | %d %d \n", __LINE__, block_idx, slice_idx, tidx, current_bit, semaphores[slice_idx]);
   Bitwise desired = desires[slice_idx];
+  IndexType kToFind = ksToFind[slice_idx];
   IndexType sliceStartIndex = at::cuda::detail::IndexToOffset<T, IndexType, Dim>::get(slice_idx, input);
   T* data = &input.data[sliceStartIndex];
 
@@ -250,15 +260,24 @@ __global__ void radixFindKthValues(
   // collect counts and store in shared memorey for each thread
   for (int i = 0; i < items_per_thread; ++i) {
     // Find the start offset for our slice
-    IndexType idx = (tidx + i * BLOCK_THREADS) * withinSliceStride;
-    if ((sliceStartIndex + idx) < inputSliceSize) {
+    IndexType idx = (tidx + i * BLOCK_THREADS + blk_idx_in_slice * ITEMS_PER_BLOCK) * withinSliceStride;
+    if (idx < inputSliceSize) {
+      T val_ori = doLdg(&data[idx]);
       Bitwise val = TopKTypeConfig<T>::convert(doLdg(&data[idx]));
-      bool hasVal = ((val & desiredMask) == desired);
+      bool hasVal = ((val & desiredMask) == (desired & desiredMask));
+      // printf("Reach line number %d, %d %d %d | %ud %x %ud %x\n", __LINE__, block_idx, slice_idx, tidx, val, val, desired, desired);
+      if (3 < val_ori &&  val_ori < 4){
+        // printf("Reach line number %d, %d %d %d | %f| %ud %x %ud %x | %d\n", __LINE__, block_idx, slice_idx, tidx, val_ori, val, val, desired, desired, current_bit);
+      }
       Bitwise digit = at::cuda::Bitfield<Bitwise>::getBitfield(val, current_bit, RADIX_BITS);
       if (hasVal) {
         temp_storage
-            .thread_counters[digit / COUNTER_LANES][tidx]
-                            [digit % COUNTER_LANES]++; // threads in a warp is guaranteed to access different banks
+            .thread_counters[digit / PACKING_RATIO][tidx]
+                            [digit % PACKING_RATIO]++; // threads in a warp is guaranteed to access different banks
+        int a = temp_storage
+        .thread_counters[digit / PACKING_RATIO][tidx]
+                        [digit % PACKING_RATIO];
+        // printf("Reach line number %d, %d %d %d | %d %x %d\n", __LINE__, block_idx, slice_idx, tidx, digit, digit, a);
       }
     }
   }
@@ -272,29 +291,39 @@ __global__ void radixFindKthValues(
     int digit = i * BLOCK_THREADS + tidx;
     for (int j = 0, idx = tidx; j < BLOCK_THREADS;
          ++j, idx = (idx + 1) % BLOCK_THREADS) { // every thread access different bank
-      digit_count += temp_storage.thread_counters[digit / COUNTER_LANES][idx][digit % COUNTER_LANES];
+      digit_count += temp_storage.thread_counters[digit / PACKING_RATIO][idx][digit % PACKING_RATIO];
+      int a = temp_storage.thread_counters[digit / PACKING_RATIO][idx][digit % PACKING_RATIO];
+      if (a>0){
+        // printf("Reach line number %d, %d %d %d | %d %x %d %d\n", __LINE__, block_idx, slice_idx, tidx, digit, digit, a, digit_count);
+      }
     }
     counts[block_idx * RADIX_DIGITS + digit] = digit_count;
+    if (digit_count > 0){
+      // printf("Reach line number %d, %d %d %d | %x %d\n", __LINE__, block_idx, slice_idx, tidx, digit, digit_count);
+    }
   }
 
+  __threadfence(); // make sure writes are globally visible
   __syncthreads();
 
-  __shared__ bool is_last_block_done_shared;
-  __shared__ bool desired_found;
+  __shared__ bool s_is_last_block_done;
+  __shared__ bool s_desired_found;
 
   if (tidx == 0) {
     int blocks_finished_old = atomicAdd(&semaphores[slice_idx], 1);
-    is_last_block_done_shared = (blocks_finished_old == (blocks_per_slice - 1));
-    desired_found = false;
+    s_is_last_block_done = (blocks_finished_old == blocks_per_slice - 1);
+    s_desired_found = false;
   }
 
   __syncthreads();
 
   // last block for each slice accumulate counts from blocks and update desired
-  if (is_last_block_done_shared) {
+  if (s_is_last_block_done) {
     // sum block counts
     BlockPrefixCallbackOp prefix_op(0);
-    for (int digit = tidx; digit < RADIX_DIGITS && !desired_found; digit += BLOCK_THREADS) {
+
+    auto post_process = [&](int digit){
+
       IndexType digit_count = 0;
       IndexType& digit_count_cumsum = digit_count;
       for (int blk = 0; blk < blocks_per_slice; ++blk) {
@@ -308,25 +337,45 @@ __global__ void radixFindKthValues(
       __syncthreads();
 
       // update desired
-      IndexType digit_count_cumsum_left = (digit == 0) ? 0 : temp_storage.scan_storage.digit_count_cumsum[digit - 1];
-      int k = Order ? inputSliceSize - outputSliceSize + 1 : outputSliceSize;
-      if (digit_count_cumsum_left < k && k <= digit_count_cumsum) {
+      IndexType digit_count_cumsum_left;
+      if (Order){
+        digit_count_cumsum_left = (digit == RADIX_DIGITS - 1) ? 0 : temp_storage.scan_storage.digit_count_cumsum[digit + 1];
+      }else{
+        digit_count_cumsum_left = (digit == 0) ? 0 : temp_storage.scan_storage.digit_count_cumsum[digit - 1];
+      }
+      // printf("Reach line number %d, %d %d %d | %d %x | %d %d %d \n", __LINE__, block_idx, slice_idx, tidx, digit, digit, kToFind, digit_count_cumsum_left, digit_count_cumsum);
+      if (digit_count_cumsum_left < kToFind && kToFind <= digit_count_cumsum) {
         desired = at::cuda::Bitfield<Bitwise>::setBitfield(desired, digit, current_bit, RADIX_BITS);
+        // printf("Reach line number %d, %d %d %d | %d %x %d %x | %d\n", __LINE__, block_idx, slice_idx, tidx, (int)digit, (int)digit, desired, desired, kToFind);
         if (current_bit > 0) {
           desires[slice_idx] = desired;
+          ksToFind[slice_idx] = kToFind - digit_count_cumsum_left;
+          int a = kToFind - digit_count_cumsum_left;
+          // printf("Reach line number %d, %d %d %d | %ud %x %ud %x | %d %d | %d\n", __LINE__, block_idx, slice_idx, tidx, (int)digit, (int)digit, desired, desired, kToFind, a, current_bit);
         } else {
           kthValues[slice_idx] = TopKTypeConfig<T>::deconvert(desired);
+          // printf("1 %d %d %d %f\n", block_idx, slice_idx, tidx, TopKTypeConfig<T>::deconvert(desired));
         }
-        desired_found = true;
+        s_desired_found = true;
       }
       __syncthreads();
+    };
+
+    if (Order){
+      for (int digit = RADIX_DIGITS - tidx - 1; digit >= 0 && !s_desired_found; digit -= BLOCK_THREADS) {
+        post_process(digit);
+      }
+    }else{
+      for (int digit = tidx; digit < RADIX_DIGITS && !s_desired_found; digit += BLOCK_THREADS) {
+        post_process(digit);
+      }
+    }
+
+    if (tidx == 0) {
+      semaphores[slice_idx] = 0;
     }
   }
-  // // Find the k-th highest element in our input
-  // T topKValue = static_cast<T>(0);
-  // radixSelect<T, typename TopKTypeConfig<T>::RadixType, IndexType, Order>(
-  //     inputSliceStart, outputSliceSize, inputSliceSize, withinSliceStride, smem, &topKValue);
-  // const auto topKConverted = at::native::TopKTypeConfig<T>::convert(topKValue);
+
 };
 
 // TODO renmae Order to IsAscending
@@ -347,8 +396,8 @@ void dispatchGatherTopK(
     at::cuda::detail::TensorInfo<int64_t, IndexType> indices,
     IndexType indicesWithinSliceStride) {
   using Bitwise = typename TopKTypeConfig<T>::RadixType;
-  std::cout << "sizeof tensorinfo: " << sizeof(at::cuda::detail::TensorInfo<T, IndexType>) << std::endl;
-  std::cout << "sizeof int: " << sizeof(int) << std::endl;
+  // std::cout << "sizeof tensorinfo: " << sizeof(at::cuda::detail::TensorInfo<T, IndexType>) << std::endl;
+  // std::cout << "sizeof int: " << sizeof(int) << std::endl;
   if (multiblock) {
     int64_t blocks_per_slice = at::ceil_div((int64_t)inputSliceSize, (int64_t)ITEMS_PER_BLOCK);
     int64_t num_blocks = numInputSlices * blocks_per_slice;
@@ -358,9 +407,16 @@ void dispatchGatherTopK(
 
     auto kthValues_buffer = allocator.allocate(numInputSlices * sizeof(T));
     T* kthValues = reinterpret_cast<T*>(kthValues_buffer.get());
+    AT_CUDA_CHECK(cudaMemsetAsync(kthValues, 0, numInputSlices * sizeof(T), c10::cuda::getCurrentCUDAStream()));
 
     auto semaphores_buffer = allocator.allocate(numInputSlices * sizeof(int));
     int* semaphores = reinterpret_cast<int*>(semaphores_buffer.get());
+    AT_CUDA_CHECK(cudaMemsetAsync(semaphores, 0, numInputSlices * sizeof(int), c10::cuda::getCurrentCUDAStream()));
+
+    auto ksToFind_buffer = allocator.allocate(numInputSlices * sizeof(IndexType));
+    IndexType* ksToFind = reinterpret_cast<IndexType*>(ksToFind_buffer.get());
+    fill<IndexType><<<std::min((numInputSlices + 511) / 512, (IndexType)65535), 512, 0, c10::cuda::getCurrentCUDAStream()>>>(ksToFind, outputSliceSize, numInputSlices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     auto desired_buffer = allocator.allocate(numInputSlices * sizeof(Bitwise));
     Bitwise* desired = reinterpret_cast<Bitwise*>(desired_buffer.get());
@@ -369,14 +425,16 @@ void dispatchGatherTopK(
     IndexType* counts = reinterpret_cast<IndexType*>(counts_buffer.get());
 
     Bitwise desiredMask = 0;
+    dim3 grid;
+    TORCH_INTERNAL_ASSERT(getGridFromTiles(num_blocks, grid), "Too many slices to sort");
+    dim3 block(BLOCK_THREADS);
     for (int current_bit = sizeof(T) * 8 - RADIX_BITS; current_bit >= 0; current_bit -= RADIX_BITS) {
-      dim3 grid;
-      TORCH_INTERNAL_ASSERT(getGridFromTiles(num_blocks, grid), "Too many slices to sort");
-      dim3 block(BLOCK_THREADS);
+      // std::cout << "current_bit: " << current_bit << std::endl;
+      // std::cout << "desiredMask: " << std::bitset<32>(desiredMask).to_string() << std::endl;
       radixFindKthValues<T, IndexType, Bitwise, Dim, Order><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
           input,
           inputSliceSize,
-          outputSliceSize,
+          ksToFind,
           numInputSlices,
           inputWithinSliceStride,
           current_bit,
@@ -390,17 +448,17 @@ void dispatchGatherTopK(
       desiredMask = at::cuda::Bitfield<Bitwise>::setBitfield(desiredMask, RADIX_MASK, current_bit, RADIX_BITS);
     }
 
-    for (int i = 0; i < numInputSlices; ++i) {
-      std::cout << "slice " << i << ": ";
-      cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
-      print_kernel<T><<<1, 1>>>(kthValues + i);
-      cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
-    }
+    // for (int i = 0; i < numInputSlices; ++i) {
+    //   std::cout << "slice " << i << ": ";
+    //   cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
+    //   print_kernel<T><<<1, 1>>>(kthValues + i);
+    //   cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
+    // }
 
     // Find values that are strictly less/greater than the top-K value
 
     // Find values that are == the top-K value
-    {
+    if (true){
       dim3 grid;
       TORCH_INTERNAL_ASSERT(getGridFromTiles(numInputSlices, grid), "Too many slices to sort");
       dim3 block(std::min(
