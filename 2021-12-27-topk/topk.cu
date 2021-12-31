@@ -47,6 +47,12 @@ struct BlockPrefixCallbackOp {
   }
 };
 
+
+template <typename T>
+__global__ void print_kernel(T* x){
+  printf("%f\n", *x);
+}
+
 template <typename T, typename IndexType, int Dim, bool Order>
 C10_LAUNCH_BOUNDS_1(1024)
 __global__ void gatherTopK(
@@ -62,7 +68,8 @@ __global__ void gatherTopK(
     IndexType topKWithinSliceStride,
 
     at::cuda::detail::TensorInfo<int64_t, IndexType> indices,
-    IndexType indicesWithinSliceStride) {
+    IndexType indicesWithinSliceStride,
+    T* kthValues) {
   // Indices are limited to integer fp precision, so counts can fit in
   // int32, regardless of IndexType
 #if defined(USE_ROCM)
@@ -85,9 +92,7 @@ __global__ void gatherTopK(
   int64_t* indicesSliceStart = &indices.data[indicesSliceStartIndex];
 
   // Find the k-th highest element in our input
-  T topKValue = static_cast<T>(0);
-  radixSelect<T, typename TopKTypeConfig<T>::RadixType, IndexType, Order>(
-      inputSliceStart, outputSliceSize, inputSliceSize, inputWithinSliceStride, smem, &topKValue);
+  T topKValue = kthValues[slice];
   const auto topKConverted = at::native::TopKTypeConfig<T>::convert(topKValue);
 
   // Every value that is strictly less/greater than `pattern`
@@ -306,7 +311,12 @@ __global__ void radixFindKthValues(
       IndexType digit_count_cumsum_left = (digit == 0) ? 0 : temp_storage.scan_storage.digit_count_cumsum[digit - 1];
       int k = Order ? inputSliceSize - outputSliceSize + 1 : outputSliceSize;
       if (digit_count_cumsum_left < k && k <= digit_count_cumsum) {
-        desires[slice_idx] = at::cuda::Bitfield<Bitwise>::setBitfield(desired, digit, current_bit, RADIX_BITS);
+        desired = at::cuda::Bitfield<Bitwise>::setBitfield(desired, digit, current_bit, RADIX_BITS);
+        if (current_bit > 0) {
+          desires[slice_idx] = desired;
+        } else {
+          kthValues[slice_idx] = TopKTypeConfig<T>::deconvert(desired);
+        }
         desired_found = true;
       }
       __syncthreads();
@@ -380,27 +390,53 @@ void dispatchGatherTopK(
       desiredMask = at::cuda::Bitfield<Bitwise>::setBitfield(desiredMask, RADIX_MASK, current_bit, RADIX_BITS);
     }
 
+    for (int i = 0; i < numInputSlices; ++i) {
+      std::cout << "slice " << i << ": ";
+      cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
+      print_kernel<T><<<1, 1>>>(kthValues + i);
+      cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
+    }
+
     // Find values that are strictly less/greater than the top-K value
 
     // Find values that are == the top-K value
-
+    {
+      dim3 grid;
+      TORCH_INTERNAL_ASSERT(getGridFromTiles(numInputSlices, grid), "Too many slices to sort");
+      dim3 block(std::min(
+          at::ceil_div((int64_t)inputSliceSize, (int64_t)C10_WARP_SIZE) * (int64_t)C10_WARP_SIZE, (int64_t)1024));
+      gatherTopK<T, IndexType, Dim, Order><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+          input,
+          inputSliceSize,
+          outputSliceSize,
+          numInputSlices,
+          inputWithinSliceStride,
+          topK,
+          numTopKSlices,
+          topKWithinSliceStride,
+          indices,
+          indicesWithinSliceStride,
+          kthValues);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
   } else {
-    dim3 grid;
-    TORCH_INTERNAL_ASSERT(getGridFromTiles(numInputSlices, grid), "Too many slices to sort");
-    dim3 block(std::min(
-        at::ceil_div((int64_t)inputSliceSize, (int64_t)C10_WARP_SIZE) * (int64_t)C10_WARP_SIZE, (int64_t)1024));
-    gatherTopK<T, IndexType, Dim, Order><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        input,
-        inputSliceSize,
-        outputSliceSize,
-        numInputSlices,
-        inputWithinSliceStride,
-        topK,
-        numTopKSlices,
-        topKWithinSliceStride,
-        indices,
-        indicesWithinSliceStride);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    ;
+    // dim3 grid;
+    // TORCH_INTERNAL_ASSERT(getGridFromTiles(numInputSlices, grid), "Too many slices to sort");
+    // dim3 block(std::min(
+    //     at::ceil_div((int64_t)inputSliceSize, (int64_t)C10_WARP_SIZE) * (int64_t)C10_WARP_SIZE, (int64_t)1024));
+    // gatherTopK<T, IndexType, Dim, Order><<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    //     input,
+    //     inputSliceSize,
+    //     outputSliceSize,
+    //     numInputSlices,
+    //     inputWithinSliceStride,
+    //     topK,
+    //     numTopKSlices,
+    //     topKWithinSliceStride,
+    //     indices,
+    //     indicesWithinSliceStride);
+    // C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
