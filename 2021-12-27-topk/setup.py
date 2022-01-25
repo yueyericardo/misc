@@ -22,7 +22,7 @@ def cuda_extension(build_all=False):
             if sm not in SMs and sm >= 50:
                 SMs.append(sm)
 
-    nvcc_args = ["-Xptxas=-v"]
+    nvcc_args = ["-Xptxas=-v", "-lineinfo"]
     if SMs:
         for sm in SMs:
             nvcc_args.append(f"-gencode=arch=compute_{sm},code=sm_{sm}")
