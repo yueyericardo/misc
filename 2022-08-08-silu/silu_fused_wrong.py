@@ -208,11 +208,13 @@ def test_integrated(input):
 
 if __name__ == "__main__":
     input = torch.randn(20, 20, dtype=torch.double, requires_grad=True, device="cuda")
-    test = torch.autograd.gradcheck(MySiLU.apply, input, eps=1e-6, atol=1e-4)
+    f = lambda x : MySiLU.apply(x) * torch.sin(x)
+    test = torch.autograd.gradcheck(f, input, eps=1e-6, atol=1e-4)
     print(test)
 
     input1 = (input, torch.ones_like(input))
-    test = torch.autograd.gradcheck(MySiLU_1.apply, input1, eps=1e-6, atol=1e-4)
+    f = lambda x, y : MySiLU_1.apply(x, y) * torch.sin(x) * torch.sin(y)
+    test = torch.autograd.gradcheck(f, input1, eps=1e-6, atol=1e-4)
     print(test)
 
     test = torch.autograd.gradcheck(MySiLU_2.apply, input1, eps=1e-6, atol=1e-4)

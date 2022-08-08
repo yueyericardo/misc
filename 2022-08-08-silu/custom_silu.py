@@ -3,14 +3,18 @@ import torch
 from torch.autograd import Function
 from torch._C._nvfuser import Fusion, FusionDefinition, DataType
 
-def silu1(fd, x):
+def local_silu1(fd, x):
     one = fd.define_constant(1.0)
     # y = sigmoid(x)
     y = fd.ops.sigmoid(x)
     # z = sigmoid(x)
     return fd.ops.mul(y, fd.ops.add(one, fd.ops.mul(x, fd.ops.sub(one, y))))
 
-def silu2(fd, x):
+def silu1(fd, x, gsilu):
+    local_gx = local_silu1(fd, x)
+    return fd.ops.mul(local_gx, gsilu)
+
+def local_silu2(fd, x):
     one = fd.define_constant(1.0)
 
     # y = sigmoid(x)
@@ -26,6 +30,10 @@ def silu2(fd, x):
     term2 = fd.ops.mul(y, fd.ops.sub(fd.ops.sub(one, y), fd.ops.mul(x, dy)))
 
     return fd.ops.add(term1, term2)
+
+def silu2(fd, x, gsilu1):
+    local_ggx = local_silu2(fd, x)
+    return fd.ops.mul(local_ggx, gsilu1)
 
 def silu3(fd, x):
     one = fd.define_constant(1.0)
@@ -71,10 +79,9 @@ def silu_backward_for(dtype, dim):
 
     with FusionDefinition(fusion) as fd :
         x = fd.define_tensor(dim, dtype)
-        grad_output = fd.define_tensor(dim, dtype)
-        grad_input = silu1(fd, x)
-        grad_input = fd.ops.cast(grad_input, dtype)
-        fd.add_output(fd.ops.mul(grad_input, grad_output))
+        gsilu = fd.define_tensor(dim, dtype)
+        gx = silu1(fd, x, gsilu)
+        fd.add_output(fd.ops.cast(gx, dtype))
 
     return fusion
 
@@ -93,9 +100,20 @@ def silu_double_backward_for(dtype, dim):
 
     with FusionDefinition(fusion) as fd :
         x = fd.define_tensor(dim, dtype)
-        grad_input = silu2(fd, x)
-        grad_input = fd.ops.cast(grad_input, dtype)
-        fd.add_output(grad_input)
+        gsilu = fd.define_tensor(dim, dtype)
+        ggx = fd.define_tensor(dim, dtype)
+
+        local_gx = local_silu1(fd, x)
+        ggsilu = fd.ops.mul(local_gx, ggx)
+
+        gsilu1 = fd.ops.mul(ggx, gsilu)
+        gx = silu2(fd, x, gsilu1)
+
+        gx = fd.ops.cast(gx, dtype)
+        ggsilu = fd.ops.cast(ggsilu, dtype)
+
+        fd.add_output(gx)
+        fd.add_output(ggsilu)
 
     return fusion
 
@@ -128,35 +146,36 @@ class MySiLU(Function):
         return torch.nn.functional.silu(x)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, gsilu):
         (x,) = ctx.saved_tensors
-        return MySiLU_1.apply(x, grad_output)
+        return MySiLU_1.apply(x, gsilu)
 
 
 class MySiLU_1(Function):
     @staticmethod
-    def forward(ctx, x, grad_output):
-        ctx.save_for_backward(x)
+    def forward(ctx, x, gsilu):
+        ctx.save_for_backward(x, gsilu)
         silu_backward = silu_backward_for(x.dtype, x.dim())
-        return silu_backward.execute([x, grad_output])[0]
+        gx = silu_backward.execute([x, gsilu])[0]
+        return gx
 
     @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        return MySiLU_2.apply(x) * grad_output
+    def backward(ctx, ggx):
+        (x, gsilu) = ctx.saved_tensors
+        return MySiLU_2.apply(x, gsilu, ggx)
 
 
 class MySiLU_2(Function):
     @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
+    def forward(ctx, x, gsilu, ggx):
+        ctx.save_for_backward(x, gsilu, ggx)
         silu_double_backward = silu_double_backward_for(x.dtype, x.dim())
-        return silu_double_backward.execute([x])[0]
+        return tuple(silu_double_backward.execute([x, gsilu, ggx]))
 
     @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        return MySiLU_3.apply(x) * grad_output
+    def backward(ctx, grad_output, a):
+        (x, b, c) = ctx.saved_tensors
+        return MySiLU_3.apply(x) * grad_output, b, c
 
 
 class MySiLU_3(Function):
@@ -190,8 +209,9 @@ def test_integrated(input):
 
 if __name__ == "__main__":
     input = torch.randn(20, 20, dtype=torch.double, requires_grad=True, device="cuda")
-    # test = torch.autograd.gradcheck(MySiLU.apply, input, eps=1e-6, atol=1e-4)
-    # print(test)
+    f = lambda x : MySiLU.apply(x) * torch.sin(x)
+    test = torch.autograd.gradcheck(f, input, eps=1e-6, atol=1e-4)
+    print(test)
 
     # test = torch.autograd.gradcheck(MySiLU_1.apply, input, eps=1e-6, atol=1e-4)
     # print(test)
